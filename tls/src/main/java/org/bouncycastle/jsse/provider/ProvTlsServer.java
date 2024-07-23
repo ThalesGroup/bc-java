@@ -7,6 +7,7 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Hashtable;
 import java.util.LinkedHashMap;
@@ -17,7 +18,9 @@ import java.util.Vector;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import org.bouncycastle.asn1.ocsp.OCSPResponse;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.jce.provider.OcspResponseManager;
 import org.bouncycastle.jsse.BCSNIMatcher;
 import org.bouncycastle.jsse.BCSNIServerName;
 import org.bouncycastle.jsse.BCX509Key;
@@ -27,9 +30,13 @@ import org.bouncycastle.tls.AlertLevel;
 import org.bouncycastle.tls.Certificate;
 import org.bouncycastle.tls.CertificateRequest;
 import org.bouncycastle.tls.CertificateStatus;
+import org.bouncycastle.tls.CertificateStatusRequestItemV2;
+import org.bouncycastle.tls.CertificateStatusType;
 import org.bouncycastle.tls.ClientCertificateType;
 import org.bouncycastle.tls.DefaultTlsServer;
 import org.bouncycastle.tls.KeyExchangeAlgorithm;
+import org.bouncycastle.tls.NamedGroup;
+import org.bouncycastle.tls.OCSPStatusRequest;
 import org.bouncycastle.tls.ProtocolName;
 import org.bouncycastle.tls.ProtocolVersion;
 import org.bouncycastle.tls.SecurityParameters;
@@ -45,6 +52,7 @@ import org.bouncycastle.tls.TlsSession;
 import org.bouncycastle.tls.TlsUtils;
 import org.bouncycastle.tls.TrustedAuthority;
 import org.bouncycastle.tls.crypto.DHGroup;
+import org.bouncycastle.tls.crypto.TlsDHConfig;
 import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCrypto;
 import org.bouncycastle.util.Arrays;
 import org.bouncycastle.util.encoders.Hex;
@@ -60,11 +68,6 @@ class ProvTlsServer
     // TODO[jsse] Integrate this into NamedGroupInfo
     private static final int provEphemeralDHKeySize = PropertyUtils.getIntegerSystemProperty("jdk.tls.ephemeralDHKeySize", 2048, 1024, 8192);
 
-    /*
-     * TODO[jsse] Does this selection override the restriction from 'jdk.tls.ephemeralDHKeySize'?
-     * TODO[fips] Probably should be ignored in fips mode?
-     */
-    @SuppressWarnings("unused")
     private static final DHGroup[] provServerDefaultDHEParameters = getDefaultDHEParameters();
 
     private static final boolean provServerEnableCA = PropertyUtils
@@ -73,10 +76,8 @@ class ProvTlsServer
     private static final boolean provServerEnableSessionResumption = PropertyUtils
         .getBooleanSystemProperty("org.bouncycastle.jsse.server.enableSessionResumption", true);
 
-    // TODO[jsse] Support status_request and status_request_v2 extensions
-//    private static final boolean provServerEnableStatusRequest = PropertyUtils.getBooleanSystemProperty(
-//        "jdk.tls.server.enableStatusRequestExtension", false);
-    private static final boolean provServerEnableStatusRequest = false;
+    private static final boolean provServerEnableStatusRequest = PropertyUtils
+            .getBooleanSystemProperty("jdk.tls.server.enableStatusRequestExtension", false);
 
     private static final boolean provServerEnableTrustedCAKeys = PropertyUtils
         .getBooleanSystemProperty("org.bouncycastle.jsse.server.enableTrustedCAKeysExtension", false);
@@ -99,7 +100,7 @@ class ProvTlsServer
             return null;
         }
 
-        ArrayList<DHGroup> result = new ArrayList<DHGroup>();
+        ArrayList<DHGroup> dhGroups = new ArrayList<DHGroup>();
         int outerComma = -1;
         do
         {
@@ -133,7 +134,7 @@ class ProvTlsServer
                 DHGroup dhGroup = TlsDHUtils.getStandardGroupForDHParameters(p, g);
                 if (null != dhGroup)
                 {
-                    result.add(dhGroup);
+                    dhGroups.add(dhGroup);
                 }
                 else if (!p.isProbablePrime(120))
                 {
@@ -142,7 +143,7 @@ class ProvTlsServer
                 }
                 else
                 {
-                    result.add(new DHGroup(p, null, g, 0));
+                    dhGroups.add(new DHGroup(p, null, g, 0));
                 }
             }
             catch (Exception e)
@@ -153,7 +154,15 @@ class ProvTlsServer
             outerComma = closeBrace + 1;
             if (outerComma >= limit)
             {
-                return result.toArray(new DHGroup[result.size()]);
+                DHGroup[] result = dhGroups.toArray(new DHGroup[dhGroups.size()]);
+                java.util.Arrays.sort(result, new Comparator<DHGroup>()
+                {
+                    public int compare(DHGroup a, DHGroup b)
+                    {
+                        return a.getP().bitLength() - b.getP().bitLength();
+                    }
+                });
+                return result;
             }
         }
         while (',' == input.charAt(outerComma));
@@ -227,7 +236,7 @@ class ProvTlsServer
         // CAUTION: Required for Common Criteria
 
         StringBuilder sb = new StringBuilder(serverID);
-        
+
         int[] offered = offeredCipherSuites;
         if (TlsUtils.isNullOrEmpty(offered))
         {
@@ -259,13 +268,29 @@ class ProvTlsServer
     @Override
     protected int getMaximumNegotiableCurveBits()
     {
-        return NamedGroupInfo.getMaximumBitsServerECDH(jsseSecurityParameters.namedGroups);
+        NamedGroupInfo.DefaultedResult maxBitsResult = NamedGroupInfo.getMaximumBitsServerECDH(
+            jsseSecurityParameters.namedGroups);
+
+        int maxBits = maxBitsResult.getResult();
+
+        return maxBits;
     }
 
     @Override
     protected int getMaximumNegotiableFiniteFieldBits()
     {
-        int maxBits = NamedGroupInfo.getMaximumBitsServerFFDHE(jsseSecurityParameters.namedGroups);
+        NamedGroupInfo.DefaultedResult maxBitsResult = NamedGroupInfo.getMaximumBitsServerFFDHE(
+            jsseSecurityParameters.namedGroups);
+
+        int maxBits = maxBitsResult.getResult();
+
+        if (maxBitsResult.isDefaulted() &&
+            !TlsUtils.isNullOrEmpty(provServerDefaultDHEParameters) &&
+            !manager.getContextData().getContext().isFips())
+        {
+            DHGroup largest = provServerDefaultDHEParameters[provServerDefaultDHEParameters.length - 1];
+            maxBits = Math.max(maxBits, largest.getP().bitLength());
+        }
 
         return maxBits >= provEphemeralDHKeySize ? maxBits : 0;
     }
@@ -325,11 +350,41 @@ class ProvTlsServer
     }
 
     @Override
-    protected int selectDH(int minimumFiniteFieldBits)
+    public TlsDHConfig getDHConfig() throws IOException
     {
+        int minimumFiniteFieldBits = TlsDHUtils.getMinimumFiniteFieldBits(selectedCipherSuite);
         minimumFiniteFieldBits = Math.max(minimumFiniteFieldBits, provEphemeralDHKeySize);
 
-        return NamedGroupInfo.selectServerFFDHE(jsseSecurityParameters.namedGroups, minimumFiniteFieldBits);
+        NamedGroupInfo.DefaultedResult namedGroupResult = NamedGroupInfo.selectServerFFDHE(
+            jsseSecurityParameters.namedGroups, minimumFiniteFieldBits);
+
+        int namedGroup = namedGroupResult.getResult();
+
+        if (namedGroupResult.isDefaulted() &&
+            !TlsUtils.isNullOrEmpty(provServerDefaultDHEParameters) &&
+            !manager.getContextData().getContext().isFips())
+        {
+            for (DHGroup dhGroup : provServerDefaultDHEParameters)
+            {
+                int bits = dhGroup.getP().bitLength();
+                if (bits >= minimumFiniteFieldBits)
+                {
+                    if (namedGroup < 0 || bits <= NamedGroup.getFiniteFieldBits(namedGroup))
+                    {
+                        return new TlsDHConfig(dhGroup);
+                    }
+                    break;
+                }
+            }
+        }
+
+        return TlsDHUtils.createNamedDHConfig(context, namedGroup);
+    }
+
+    @Override
+    protected int selectDH(int minimumFiniteFieldBits)
+    {
+        throw new UnsupportedOperationException();
     }
 
     @Override
@@ -341,7 +396,7 @@ class ProvTlsServer
     @Override
     protected int selectECDH(int minimumCurveBits)
     {
-        return NamedGroupInfo.selectServerECDH(jsseSecurityParameters.namedGroups, minimumCurveBits);
+        return NamedGroupInfo.selectServerECDH(jsseSecurityParameters.namedGroups, minimumCurveBits).getResult();
     }
 
     @Override
@@ -476,53 +531,115 @@ class ProvTlsServer
     @Override
     public CertificateStatus getCertificateStatus() throws IOException
     {
-        // TODO[jsse] Support status_request and status_request_v2 extensions
-//        SecurityParameters securityParameters = context.getSecurityParametersHandshake();
-//        int statusRequestVersion = securityParameters.getStatusRequestVersion();
-//
-//        if (statusRequestVersion == 2)
-//        {
-//            int count = statusRequestV2.size();
-//            for (int i = 0; i < count; ++i)
-//            {
-//                CertificateStatusRequestItemV2 item = (CertificateStatusRequestItemV2)statusRequestV2.get(i);
-//                short statusType = item.getStatusType();
-//                if (CertificateStatusType.ocsp_multi == statusType)
-//                {
-//                    int chainLength = credentials.getCertificate().getLength();
-//                    Vector ocspResponseList = new Vector(chainLength);
-//                    for (int j = 0; j < chainLength; ++j)
-//                    {
-//                        // TODO Actual OCSP response
-//                        ocspResponseList.add(null);
-//                    }
-//
-//                    return new CertificateStatus(CertificateStatusType.ocsp_multi, ocspResponseList);
-//                }
-//                else if (CertificateStatusType.ocsp == statusType)
-//                {
-//                    // TODO Actual OCSP response
-//                    OCSPResponse ocspResponse;
-//
-//                    return new CertificateStatus(CertificateStatusType.ocsp, ocspResponse);
-//                }
-//            }
-//        }
-//        else if (statusRequestVersion == 1)
-//        {
-//            if (CertificateStatusType.ocsp == certificateStatusRequest.getStatusType())
-//            {
-//                OCSPStatusRequest ocspStatusRequest = certificateStatusRequest.getOCSPStatusRequest();
-//
-//                @SuppressWarnings("unchecked")
-//                Vector<ResponderID> responderIDList = ocspStatusRequest.getResponderIDList();
-//                Extensions requestExtensions = ocspStatusRequest.getRequestExtensions();
-//
-//                X509Certificate eeCert = JsseUtils.getEndEntity(getCrypto(), credentials.getCertificate());
-//
-//                // ...
-//            }
-//        }
+        // check supported
+        if (!allowCertificateStatus() && !allowMultiCertStatus())
+        {
+            return null;
+        }
+
+        // for both status_request and status_request_v2 we need at least 2 certificates in the chain in order to staple the response(s)
+        int chainLength = credentials.getCertificate().getLength();
+        if (chainLength < 2)
+        {
+            return null;
+        }
+
+        SecurityParameters securityParameters = context.getSecurityParametersHandshake();
+        int statusRequestVersion = securityParameters.getStatusRequestVersion();
+
+        // NOTE: we can have status_request_v2 only in tls12 and NOT tls13
+        if (statusRequestVersion == 2)
+        {
+            // for status_request_v2 we can have multiple status request items of type "ocsp_multi" or "ocsp",
+            // so we will try to find a valid "ocsp_multi" item and process that, or, if not found, a valid "ocsp" item
+            int count = statusRequestV2.size();
+            int ocspMultiIdx = -1;
+            int ocspIdx = -1;
+            for (int i = 0; i < count; i++)
+            {
+                CertificateStatusRequestItemV2 item = (CertificateStatusRequestItemV2) statusRequestV2.get(i);
+                if (CertificateStatusType.ocsp_multi == item.getStatusType())
+                {
+                    // JSSE doesn't support responderIds in the request
+                    if (item.getOCSPStatusRequest().getResponderIDList().isEmpty())
+                    {
+                        ocspMultiIdx = i;
+                        // found valid ocsp_multi request - no need to look further
+                        break;
+                    }
+                }
+                else if (CertificateStatusType.ocsp == item.getStatusType() && ocspIdx < 0)
+                {
+                    // JSSE doesn't support responderIds in the request
+                    if (item.getOCSPStatusRequest().getResponderIDList().isEmpty())
+                    {
+                        ocspIdx = i;
+                    }
+                }
+            }
+            if (ocspMultiIdx >= 0)
+            {
+                // for ocsp_multi retrieve the OCSP responses for all the certificates in the chain
+                CertificateStatusRequestItemV2 item = (CertificateStatusRequestItemV2) statusRequestV2.get(ocspMultiIdx);
+                Vector<OCSPResponse> ocspResponseList = new Vector<OCSPResponse>(chainLength);
+                for (int j = 0; j < chainLength - 1; ++j)
+                {
+                    // we assume that the chain is in the correct order (each certificate is issued by the next)
+                    X509Certificate cert = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(j));
+                    X509Certificate issuer = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(j + 1));
+                    OCSPResponse ocspResponse = OcspResponseManager.getOCSPResponseForStapling(cert, issuer, item.getOCSPStatusRequest().getRequestExtensions(), getCrypto().getHelper());
+                    ocspResponseList.add(ocspResponse);
+                }
+                return new CertificateStatus(CertificateStatusType.ocsp_multi, ocspResponseList);
+            }
+            if (ocspIdx >= 0)
+            {
+                // only retrieve the OCSP response for the end entity
+                CertificateStatusRequestItemV2 item = (CertificateStatusRequestItemV2) statusRequestV2.get(ocspIdx);
+                X509Certificate cert = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(0));
+                X509Certificate issuer = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(1));
+                OCSPResponse ocspResponse = OcspResponseManager.getOCSPResponseForStapling(cert, issuer, item.getOCSPStatusRequest().getRequestExtensions(), getCrypto().getHelper());
+                return new CertificateStatus(CertificateStatusType.ocsp, ocspResponse);
+            }
+        }
+        // NOTE: we can have status_request for tls12 and tls13
+        else if (statusRequestVersion == 1)
+        {
+            if (CertificateStatusType.ocsp == certificateStatusRequest.getStatusType())
+            {
+                OCSPStatusRequest ocspStatusRequest = certificateStatusRequest.getOCSPStatusRequest();
+                // JSSE doesn't support responderIds in the request
+                if (!ocspStatusRequest.getResponderIDList().isEmpty())
+                {
+                    return null;
+                }
+                if (TlsUtils.isTLSv13(context))
+                {
+                    // RFC 8446 deprecates the status_request_v2 extension and provides only the status_request extension,
+                    // but we need to retrieve the OCSP responses for all certificates in the chain
+                    Vector<OCSPResponse> ocspResponseList = new Vector<OCSPResponse>(chainLength);
+                    for (int j = 0; j < chainLength - 1; ++j)
+                    {
+                        // we assume that the chain is in the correct order (each certificate is issued by the next)
+                        X509Certificate cert = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(j));
+                        X509Certificate issuer = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(j + 1));
+                        OCSPResponse ocspResponse = OcspResponseManager.getOCSPResponseForStapling(cert, issuer, ocspStatusRequest.getRequestExtensions(), getCrypto().getHelper());
+                        ocspResponseList.add(ocspResponse);
+                    }
+                    // return an "ocsp_multi" certificate status which will be converted in the upper level to an "ocsp"
+                    // certificate status corresponding to a certificate entry
+                    return new CertificateStatus(CertificateStatusType.ocsp_multi, ocspResponseList);
+                }
+                else
+                {
+                    // only retrieve the OCSP response for the end entity
+                    X509Certificate cert = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(0));
+                    X509Certificate issuer = JsseUtils.getX509Certificate(getCrypto(), credentials.getCertificate().getCertificateAt(1));
+                    OCSPResponse ocspResponse = OcspResponseManager.getOCSPResponseForStapling(cert, issuer, ocspStatusRequest.getRequestExtensions(), getCrypto().getHelper());
+                    return new CertificateStatus(CertificateStatusType.ocsp, ocspResponse);
+                }
+            }
+        }
 
         return null;
     }

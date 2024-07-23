@@ -8,10 +8,12 @@ import java.io.OutputStream;
 import java.util.Hashtable;
 import java.util.Vector;
 
+import org.bouncycastle.asn1.ocsp.OCSPResponse;
 import org.bouncycastle.tls.crypto.TlsAgreement;
 import org.bouncycastle.tls.crypto.TlsCrypto;
 import org.bouncycastle.tls.crypto.TlsDHConfig;
 import org.bouncycastle.tls.crypto.TlsECConfig;
+import org.bouncycastle.tls.crypto.TlsKemConfig;
 import org.bouncycastle.tls.crypto.TlsSecret;
 import org.bouncycastle.util.Arrays;
 
@@ -380,6 +382,44 @@ public class TlsServerProtocol
         securityParameters.statusRequestVersion = clientHelloExtensions.containsKey(TlsExtensionsUtils.EXT_status_request)
             ? 1 : 0;
 
+        if (securityParameters.statusRequestVersion > 0)
+        {
+            // server should handle fetching of certificate statuses
+            CertificateStatus certificateStatus = tlsServer.getCertificateStatus();
+            if (certificateStatus != null)
+            {
+                // RFC 8446: In TLS 1.3, the server's OCSP information is carried in an extension in the CertificateEntry containing the
+                // associated certificate.  Specifically, the body of the "status_request" extension from the server MUST be a
+                // CertificateStatus structure as defined in [RFC6066], which is interpreted as defined in [RFC6960].
+                Vector ocspResponseList = certificateStatus.getOCSPResponseList();
+
+                // credentials (server certificate entries) should be already established at this point
+                TlsCredentials credentials = tlsServer.getCredentials();
+
+                // we assume that the certificate entries and the OCSP responses are in the same order
+                CertificateEntry[] certificateEntryList = credentials.getCertificate().getCertificateEntryList();
+                for (int i = 0; i < certificateEntryList.length - 1; i++)
+                {
+                    OCSPResponse ocspResponse = (OCSPResponse) ocspResponseList.get(i);
+                    if (ocspResponse == null)
+                    {
+                        continue;
+                    }
+                    CertificateEntry entry = certificateEntryList[i];
+                    Hashtable certificateEntryExtensions = entry.getExtensions();
+                    if (certificateEntryExtensions == null)
+                    {
+                        certificateEntryExtensions = new Hashtable();
+                        entry.setExtensions(certificateEntryExtensions);
+                    }
+                    CertificateStatus certStatus = new CertificateStatus(CertificateStatusType.ocsp, ocspResponse);
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    certStatus.encode(baos);
+                    certificateEntryExtensions.put(TlsExtensionsUtils.EXT_status_request, baos.toByteArray());
+                }
+            }
+        }
+
         this.expectSessionTicket = false;
 
         TlsSecret pskEarlySecret = null;
@@ -397,7 +437,7 @@ public class TlsServerProtocol
             int namedGroup = clientShare.getNamedGroup();
     
             TlsAgreement agreement;
-            if (NamedGroup.refersToASpecificCurve(namedGroup))
+            if (NamedGroup.refersToAnECDHCurve(namedGroup))
             {
                 agreement = crypto.createECDomain(new TlsECConfig(namedGroup)).createECDH();
             }
@@ -405,16 +445,21 @@ public class TlsServerProtocol
             {
                 agreement = crypto.createDHDomain(new TlsDHConfig(namedGroup, true)).createDH();
             }
+            else if (NamedGroup.refersToASpecificKem(namedGroup))
+            {
+                agreement = crypto.createKemDomain(new TlsKemConfig(namedGroup, true)).createKem();
+            }
             else
             {
                 throw new TlsFatalAlert(AlertDescription.internal_error);
             }
 
+            agreement.receivePeerValue(clientShare.getKeyExchange());
+
             byte[] key_exchange = agreement.generateEphemeral();
             KeyShareEntry serverShare = new KeyShareEntry(namedGroup, key_exchange);
             TlsExtensionsUtils.addKeyShareServerHello(serverHelloExtensions, serverShare);
 
-            agreement.receivePeerValue(clientShare.getKeyExchange());
             sharedSecret = agreement.calculateSecret();
         }
 
